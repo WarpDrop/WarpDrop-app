@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WarpDrop — Unlimited GB P2P Transfer</title>
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#38bdf8" />
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
+    .card { background: #1e293b; padding: 2rem; border-radius: 16px; width: 100%; max-width: 500px; box-shadow: 0 15px 35px rgba(0,0,0,0.5); border: 1px solid #334155; }
+    h1 { margin: 0 0 4px 0; font-size: 1.6rem; color: #38bdf8; }
+    .subtitle { margin: 0 0 1.25rem 0; font-size: 0.85rem; color: #94a3b8; }
+    .row { display: flex; gap: 8px; margin-bottom: 1rem; }
+    input[type="text"], input[type="file"] { flex: 1; padding: 11px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; font-size: 0.95rem; }
+    button { padding: 11px 16px; border: none; border-radius: 8px; background: #38bdf8; color: #0f172a; font-weight: 700; cursor: pointer; white-space: nowrap; }
+    button:disabled { background: #475569; color: #94a3b8; cursor: not-allowed; }
+    button.secondary { background: #334155; color: #f8fafc; }
+    button.save-btn { background: #22c55e; color: #052e16; width: 100%; font-size: 1rem; padding: 14px; margin-bottom: 1rem; display: none; }
+    .status-box { background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155; font-size: 0.9rem; color: #e2e8f0; margin-bottom: 1rem; }
+    progress { width: 100%; height: 20px; border-radius: 8px; overflow: hidden; accent-color: #38bdf8; }
+    .stats { font-size: 0.85rem; color: #cbd5e1; margin-top: 8px; display: flex; justify-content: space-between; }
+    .footer { margin-top: 1.25rem; padding-top: 0.85rem; border-top: 1px solid #334155; text-align: center; font-size: 0.8rem; color: #94a3b8; }
+    .footer a { color: #38bdf8; text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>WarpDrop P2P</h1>
+    <p class="subtitle">Direct device-to-device streaming • Unlimited GB • Zero server storage</p>
+    <div class="status-box" id="status">Initializing room...</div>
+    <div class="row">
+      <input type="text" id="roomInput" placeholder="Room code" />
+      <button id="joinBtn">Connect</button>
+      <button id="copyBtn" class="secondary">Copy Link</button>
+    </div>
+    <button id="saveFileBtn" class="save-btn">Choose Download Folder</button>
+    <div class="row">
+      <input type="file" id="fileInput" multiple disabled />
+      <button id="sendBtn" disabled>Send</button>
+    </div>
+    <progress id="progressBar" value="0" max="100"></progress>
+    <div class="stats">
+      <span id="progressText">0% (0 B / 0 B)</span>
+      <span id="speedText">0.00 MB/s • ETA --</span>
+    </div>
+    <div class="footer">
+      100% Free &amp; Unlimited • <a href="https://buymeacoffee.com" target="_blank">Support WarpDrop ☕</a>
+    </div>
+  </div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let peerConnection, dataChannel, roomId, candidateQueue = [];
+    const CHUNK_SIZE = 64 * 1024;
+    const statusEl = document.getElementById('status');
+    const roomInput = document.getElementById('roomInput');
+    const joinBtn = document.getElementById('joinBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const saveFileBtn = document.getElementById('saveFileBtn');
+    const fileInput = document.getElementById('fileInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const speedText = document.getElementById('speedText');
+    const stunHost = ['stun', 'l', 'google', 'com'].join('.');
+    const rtcConfig = { iceServers: [{ urls: 'stun:' + stunHost + ':19302' }] };
+
+    const urlRoom = new URLSearchParams(window.location.search).get('room');
+    if (urlRoom) { roomInput.value = urlRoom; connectToRoom(urlRoom); }
+    else { roomInput.value = 'warp-' + Math.random().toString(36).substring(2, 8); statusEl.textContent = 'Click Connect, then share your link with the other device.'; }
+
+    copyBtn.onclick = () => {
+      const code = roomInput.value.trim();
+      if (!code) return alert('Enter a room code first.');
+      navigator.clipboard.writeText(window.location.origin + '/?room=' + encodeURIComponent(code));
+      copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy Link'; }, 2000);
+    };
+
+    joinBtn.onclick = () => { const code = roomInput.value.trim(); if (code) connectToRoom(code); };
+
+    function connectToRoom(code) {
+      roomId = code; window.history.replaceState({}, '', '?room=' + encodeURIComponent(roomId));
+      socket.emit('join-room', roomId); statusEl.textContent = 'Waiting in room "' + roomId + '" for peer...';
+      joinBtn.disabled = true; roomInput.disabled = true;
+    }
+
+    socket.on('room-full', () => { alert('Room full.'); joinBtn.disabled = false; roomInput.disabled = false; });
+
+    socket.on('peer-joined', async () => {
+      statusEl.textContent = 'Peer joined! Linking directly...'; createPeerConnection(true);
+      const offer = await peerConnection.createOffer(); await peerConnection.setLocalDescription(offer);
+      socket.emit('signal', { roomId, data: { sdp: offer } });
+    });
+
+    socket.on('signal', async (data) => {
+      try {
+        if (!peerConnection) createPeerConnection(false);
+        if (data.sdp) {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          while (candidateQueue.length > 0) await peerConnection.addIceCandidate(candidateQueue.shift());
+          if (data.sdp.type === 'offer') {
+            const answer = await peerConnection.createAnswer(); await peerConnection.setLocalDescription(answer);
+            socket.emit('signal', { roomId, data: { sdp: answer } });
+          }
+        } else if (data.candidate) {
+          const candidate = new RTCIceCandidate(data.candidate);
+          if (peerConnection.remoteDescription && peerConnection.remoteDescription.type) await peerConnection.addIceCandidate(candidate);
+          else candidateQueue.push(candidate);
+        }
+      } catch (err) { statusEl.textContent = 'Error: ' + err.message; }
+    });
+
+    socket.on('peer-left', () => { statusEl.textContent = 'Peer disconnected.'; fileInput.disabled = true; sendBtn.disabled = true; saveFileBtn.style.display = 'none'; });
+
+    function createPeerConnection(isInitiator) {
+      peerConnection = new RTCPeerConnection(rtcConfig);
+      peerConnection.onicecandidate = (e) => { if (e.candidate) socket.emit('signal', { roomId, data: { candidate: e.candidate } }); };
+      if (isInitiator) { dataChannel = peerConnection.createDataChannel('file-transfer'); setupDataChannel(); }
+      else { peerConnection.ondatachannel = (e) => { dataChannel = e.channel; setupDataChannel(); }; }
+    }
+
+    let incomingMeta = null, receivedBytes = 0, receiveBuffer = [], writableStream = null, writeQueue = Promise.resolve(), startTime = 0, dirHandle = null;
+
+    function setupDataChannel() {
+      dataChannel.binaryType = 'arraybuffer'; dataChannel.bufferedAmountLowThreshold = 512 * 1024;
+      dataChannel.onopen = () => { statusEl.textContent = 'Connected! Direct P2P tunnel ready.'; fileInput.disabled = false; sendBtn.disabled = false; };
+      dataChannel.onmessage = async (e) => {
+        if (typeof e.data === 'string') {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'meta') {
+            incomingMeta = msg; receivedBytes = 0; receiveBuffer = []; writableStream = null; writeQueue = Promise.resolve();
+            if (dirHandle) {
+              const fileHandle = await dirHandle.getFileHandle(msg.name, { create: true });
+              writableStream = await fileHandle.createWritable();
+              startTime = Date.now(); statusEl.textContent = '[' + msg.index + '/' + msg.total + '] Saving: ' + msg.name;
+              dataChannel.send(JSON.stringify({ type: 'ready-to-receive' }));
+            } else if ('showDirectoryPicker' in window) {
+              statusEl.textContent = 'Incoming ' + msg.total + ' file(s) (' + formatBytes(msg.batchSize) + '). Choose folder once to save all!';
+              saveFileBtn.textContent = 'Choose Folder to Save All (' + msg.total + ' files • ' + formatBytes(msg.batchSize) + ')';
+              saveFileBtn.style.display = 'block';
+              saveFileBtn.onclick = async () => {
+                try {
+                  dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                  saveFileBtn.style.display = 'none';
+                  const fileHandle = await dirHandle.getFileHandle(msg.name, { create: true });
+                  writableStream = await fileHandle.createWritable();
+                  startTime = Date.now(); statusEl.textContent = '[' + msg.index + '/' + msg.total + '] Saving: ' + msg.name;
+                  dataChannel.send(JSON.stringify({ type: 'ready-to-receive' }));
+                } catch (err) { statusEl.textContent = 'Folder selection cancelled. Click green button to retry.'; }
+              };
+            } else {
+              startTime = Date.now(); statusEl.textContent = 'Receiving: ' + msg.name;
+              dataChannel.send(JSON.stringify({ type: 'ready-to-receive' }));
+            }
+          } else if (msg.type === 'ready-to-receive') {
+            startSendingChunks();
+          } else if (msg.type === 'done') {
+            if (writableStream) { await writeQueue; await writableStream.close(); writableStream = null; }
+            else {
+              const blob = new Blob(receiveBuffer); const url = URL.createObjectURL(blob);
+              const a = document.createElement('a'); a.href = url; a.download = incomingMeta.name; a.click(); receiveBuffer = [];
+            }
+            if (incomingMeta.index === incomingMeta.total) {
+              dirHandle = null; statusEl.textContent = 'All ' + incomingMeta.total + ' file(s) saved to folder!';
+            }
+          }
+        } else {
+          receivedBytes += e.data.byteLength; updateProgress(receivedBytes, incomingMeta.size, startTime);
+          if (writableStream) { const chunk = e.data; writeQueue = writeQueue.then(() => writableStream.write(chunk)); }
+          else { receiveBuffer.push(e.data); }
+        }
+      };
+    }
+
+    let fileQueue = [], activeFile = null, totalBatchFiles = 0, totalBatchBytes = 0;
+
+    sendBtn.onclick = () => {
+      fileQueue = Array.from(fileInput.files);
+      if (fileQueue.length === 0) return alert('Select files first.');
+      totalBatchFiles = fileQueue.length;
+      totalBatchBytes = fileQueue.reduce((sum, f) => sum + f.size, 0);
+      sendNextInQueue();
+    };
+
+    function sendNextInQueue() {
+      if (fileQueue.length === 0) { statusEl.textContent = 'All ' + totalBatchFiles + ' file(s) sent!'; sendBtn.disabled = false; return; }
+      activeFile = fileQueue.shift();
+      const idx = totalBatchFiles - fileQueue.length;
+      sendBtn.disabled = true;
+      statusEl.textContent = '[' + idx + '/' + totalBatchFiles + '] Waiting for receiver folder...';
+      dataChannel.send(JSON.stringify({ type: 'meta', name: activeFile.name, size: activeFile.size, index: idx, total: totalBatchFiles, batchSize: totalBatchBytes }));
+    }
+
+    function startSendingChunks() {
+      const idx = totalBatchFiles - fileQueue.length;
+      statusEl.textContent = '[' + idx + '/' + totalBatchFiles + '] Streaming: ' + activeFile.name;
+      let offset = 0; const sendStart = Date.now(); const reader = new FileReader();
+      reader.onload = (e) => {
+        dataChannel.send(e.target.result); offset += e.target.result.byteLength; updateProgress(offset, activeFile.size, sendStart);
+        if (offset < activeFile.size) {
+          if (dataChannel.bufferedAmount > dataChannel.bufferedAmountLowThreshold) { dataChannel.onbufferedamountlow = () => { dataChannel.onbufferedamountlow = null; readNextSlice(); }; }
+          else { readNextSlice(); }
+        } else { dataChannel.send(JSON.stringify({ type: 'done' })); setTimeout(sendNextInQueue, 200); }
+      };
+      function readNextSlice() { reader.readAsArrayBuffer(activeFile.slice(offset, offset + CHUNK_SIZE)); }
+      readNextSlice();
+    }
+
+    function updateProgress(current, total, start) {
+      const pct = Math.min(100, Math.round((current / total) * 100));
+      progressBar.value = pct; progressText.textContent = pct + '% (' + formatBytes(current) + ' / ' + formatBytes(total) + ')';
+      const elapsedSec = (Date.now() - start) / 1000 || 0.1, bytesPerSec = current / elapsedSec, mbPerSec = (bytesPerSec / (1024 * 1024)).toFixed(2);
+      const etaSec = bytesPerSec > 0 ? Math.round((total - current) / bytesPerSec) : 0;
+      speedText.textContent = mbPerSec + ' MB/s • ETA ' + formatTime(etaSec);
+    }
+
+    function formatBytes(bytes) {
+if (bytes === 0) return '0 B';
+const units = ['B', 'KB', 'MB', 'GB', 'TB'], i = Math.floor(Math.log(bytes) / Math.log(1024));
+return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + units[i];
+}
+function formatTime(sec) {
+if (sec <= 0) return '0s';
+const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+return h > 0 ? h + 'h ' + m + 'm' : m > 0 ? m + 'm ' + s + 's' : s + 's';
+}
+if ('serviceWorker' in navigator) {
+navigator.serviceWorker.register('/sw.js');
+}  </script>
+</body>
+</html>
